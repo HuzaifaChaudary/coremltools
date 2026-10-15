@@ -16500,6 +16500,112 @@ class TestMultiheadAttention(TorchBaseTest):
         self._assert_fast_path(res[0])
 
 
+class TestTransformerEncoderLayerFastPath(TorchBaseTest):
+    """
+    nn.TransformerEncoderLayer takes its fast path, aten::_transformer_encoder_layer_fwd, under
+    the same conditions as nn.MultiheadAttention
+    """
+
+    EMBED_DIM, NUM_HEADS, BATCH, SEQ = 16, 4, 2, 5
+
+    class Model(nn.Module):
+        def __init__(self, norm_first, activation, src_mask, src_key_padding_mask, num_layers):
+            super().__init__()
+            self.layers = nn.ModuleList(
+                [
+                    nn.TransformerEncoderLayer(
+                        TestTransformerEncoderLayerFastPath.EMBED_DIM,
+                        TestTransformerEncoderLayerFastPath.NUM_HEADS,
+                        dim_feedforward=32,
+                        batch_first=True,
+                        norm_first=norm_first,
+                        activation=activation,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+            self.src_mask = src_mask
+            self.src_key_padding_mask = src_key_padding_mask
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x, src_mask=self.src_mask, src_key_padding_mask=self.src_key_padding_mask)
+            return x
+
+    @staticmethod
+    def _make_model(norm_first=False, activation="relu", mask=None, num_layers=1):
+        src_mask, src_key_padding_mask = None, None
+        seq = TestTransformerEncoderLayerFastPath.SEQ
+        if mask == "attn":
+            # causal, so every query keeps at least one key
+            src_mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1)
+        if mask == "key_padding":
+            src_key_padding_mask = torch.zeros(
+                TestTransformerEncoderLayerFastPath.BATCH, seq, dtype=torch.bool
+            )
+            src_key_padding_mask[0, -2:] = True
+        model = TestTransformerEncoderLayerFastPath.Model(
+            norm_first, activation, src_mask, src_key_padding_mask, num_layers
+        )
+        # with a parameter that requires grad, PyTorch skips the fast path
+        return model.eval().requires_grad_(False)
+
+    @staticmethod
+    def _assert_fast_path(model_spec):
+        assert "aten::_transformer_encoder_layer_fwd" in str(model_spec.inlined_graph)
+
+    @pytest.mark.parametrize(
+        "compute_unit, backend, minimum_deployment_target, norm_first, activation, mask",
+        itertools.product(
+            compute_units,
+            backends,
+            [None, ct.target.iOS18],
+            [False, True],
+            ["relu", "gelu"],
+            [None, "key_padding", "attn"],
+        ),
+    )
+    def test_encoder_layer(
+        self, compute_unit, backend, minimum_deployment_target, norm_first, activation, mask
+    ):
+        if backend[0] == "neuralnetwork" and minimum_deployment_target == ct.target.iOS18:
+            pytest.skip("iOS18 target needs mlprogram")
+
+        model = self._make_model(norm_first=norm_first, activation=activation, mask=mask)
+        res = self.run_compare_torch(
+            (self.BATCH, self.SEQ, self.EMBED_DIM),
+            model,
+            backend=backend,
+            compute_unit=compute_unit,
+            minimum_deployment_target=minimum_deployment_target,
+        )
+        self._assert_fast_path(res[0])
+
+    @pytest.mark.parametrize(
+        "compute_unit, backend",
+        itertools.product(compute_units, backends),
+    )
+    def test_stacked_layers_with_dynamic_batch_and_seq(self, compute_unit, backend):
+        model = self._make_model(num_layers=2)
+        converter_input_type = [
+            ct.TensorType(
+                shape=(
+                    ct.RangeDim(lower_bound=1, upper_bound=4, default=self.BATCH),
+                    ct.RangeDim(lower_bound=1, upper_bound=8, default=self.SEQ),
+                    self.EMBED_DIM,
+                )
+            )
+        ]
+        res = self.run_compare_torch(
+            (self.BATCH, self.SEQ, self.EMBED_DIM),
+            model,
+            converter_input_type=converter_input_type,
+            backend=backend,
+            compute_unit=compute_unit,
+        )
+        self._assert_fast_path(res[0])
+
+
 class TestFliplr(TorchBaseTest):
     @pytest.mark.parametrize(
         "compute_unit, backend, frontend, input_shape",
