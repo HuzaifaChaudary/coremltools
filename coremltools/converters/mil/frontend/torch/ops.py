@@ -10360,40 +10360,25 @@ def scaled_dot_product_attention(context, node):
     context.add(res)
 
 
-@register_torch_op
-def _native_multi_head_attention(context, node):
+def _lower_native_multi_head_attention(
+    query: Var,
+    key: Var,
+    value: Var,
+    embed_dim: int,
+    num_heads: int,
+    qkv_weight: Var,
+    qkv_bias: Var,
+    proj_weight: Var,
+    proj_bias: Var,
+    mask: Optional[Var],
+    mask_type: Optional[int],
+    need_weights: bool,
+    name: str,
+) -> Tuple[Var, Optional[Var]]:
     """
-    The fast path of torch.nn.MultiheadAttention. PyTorch takes it for batched self attention
-    when nothing requires grad, e.g. a model traced in eval mode under torch.no_grad()
-
-    Input shapes/types:
-    - query, key, value : (B, seq, embed_dim)
-    - qkv_weight : (3 * embed_dim, embed_dim), the q, k and v projections stacked
-    - qkv_bias : (3 * embed_dim,)
-    - proj_weight : (embed_dim, embed_dim)
-    - proj_bias : (embed_dim,)
-    - mask : optional, (target_seq, source_seq) for mask_type 0,
-             (B, source_seq) for mask_type 1 and (B, num_heads, target_seq, source_seq) for mask_type 2
-    - need_weights, average_attn_weights : bool
-    - mask_type : optional int
-
-    Outputs: the attention output (B, target_seq, embed_dim), then, if need_weights,
-    the attention weights (B, target_seq, source_seq), or (B, num_heads, target_seq, source_seq)
-    when they are not averaged over the heads
-
-    nn.MultiheadAttention only takes this path with bool masks, and hands them over as float
-    masks with -inf in them. The kernel reads the mask back as boolean, so any non-zero entry
-    masks that position out
+    Shared by the torch ops that run aten::_native_multi_head_attention. Returns the attention
+    output and, if need_weights, the per head attention weights
     """
-    inputs = _get_inputs(context, node, expected=13)
-    query, key, value = inputs[:3]
-    embed_dim = inputs[3].val
-    num_heads = inputs[4].val
-    qkv_weight, qkv_bias, proj_weight, proj_bias = inputs[5:9]
-    mask = inputs[9]
-    need_weights = inputs[10].val
-    average_attn_weights = inputs[11].val
-    mask_type = inputs[12].val if inputs[12] is not None else None
     head_dim = embed_dim // num_heads
 
     def _project(x: Var, index: int) -> Var:
@@ -10435,6 +10420,7 @@ def _native_multi_head_attention(context, node):
         # Use a big enough but not easily fp16-overflow number (e.g. -3e4) as -inf
         mask = mb.mul(x=mb.cast(x=mask, dtype=types.builtin_to_string(q.dtype)), y=-3e4)
 
+    weights = None
     if need_weights:
         q = mb.mul(x=q, y=1.0 / _math.sqrt(head_dim))
         weights = mb.matmul(x=q, y=k, transpose_y=True)
@@ -10445,7 +10431,7 @@ def _native_multi_head_attention(context, node):
     elif is_current_opset_version_compatible_with(target.iOS18):
         attn = mb.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=mask)
     else:
-        attn = _utils._decompose_scaled_dot_product_attention(q, k, v, mask, node.name + "_attn")
+        attn = _utils._decompose_scaled_dot_product_attention(q, k, v, mask, name + "_attn")
 
     # (B, num_heads, target_seq, head_dim) -> (B, target_seq, embed_dim)
     attn = mb.transpose(x=attn, perm=[0, 2, 1, 3])
@@ -10453,7 +10439,50 @@ def _native_multi_head_attention(context, node):
         values=[_batch_and_seq_shape(attn), np.array([embed_dim], dtype=np.int32)], axis=0
     )
     attn = mb.reshape(x=attn, shape=shape)
-    res = _create_linear_layer(attn, proj_weight, proj_bias)
+    return _create_linear_layer(attn, proj_weight, proj_bias), weights
+
+
+@register_torch_op
+def _native_multi_head_attention(context, node):
+    """
+    The fast path of torch.nn.MultiheadAttention. PyTorch takes it for batched self attention
+    when nothing requires grad, e.g. a model traced in eval mode under torch.no_grad()
+
+    Input shapes/types:
+    - query, key, value : (B, seq, embed_dim)
+    - qkv_weight : (3 * embed_dim, embed_dim), the q, k and v projections stacked
+    - qkv_bias : (3 * embed_dim,)
+    - proj_weight : (embed_dim, embed_dim)
+    - proj_bias : (embed_dim,)
+    - mask : optional, (target_seq, source_seq) for mask_type 0,
+             (B, source_seq) for mask_type 1 and (B, num_heads, target_seq, source_seq) for mask_type 2
+    - need_weights, average_attn_weights : bool
+    - mask_type : optional int
+
+    Outputs: the attention output (B, target_seq, embed_dim), then, if need_weights,
+    the attention weights (B, target_seq, source_seq), or (B, num_heads, target_seq, source_seq)
+    when they are not averaged over the heads
+
+    nn.MultiheadAttention only takes this path with bool masks, and hands them over as float
+    masks with -inf in them. The kernel reads the mask back as boolean, so any non-zero entry
+    masks that position out
+    """
+    inputs = _get_inputs(context, node, expected=13)
+    need_weights = inputs[10].val
+    average_attn_weights = inputs[11].val
+    res, weights = _lower_native_multi_head_attention(
+        *inputs[:3],
+        embed_dim=inputs[3].val,
+        num_heads=inputs[4].val,
+        qkv_weight=inputs[5],
+        qkv_bias=inputs[6],
+        proj_weight=inputs[7],
+        proj_bias=inputs[8],
+        mask=inputs[9],
+        mask_type=inputs[12].val if inputs[12] is not None else None,
+        need_weights=need_weights,
+        name=node.name,
+    )
     res = mb.identity(x=res, name=node.outputs[0])
     context.add(res, torch_name=node.outputs[0])
 
@@ -10462,6 +10491,73 @@ def _native_multi_head_attention(context, node):
             weights = mb.reduce_mean(x=weights, axes=[1], keep_dims=False)
         weights = mb.identity(x=weights, name=node.outputs[1])
         context.add(weights, torch_name=node.outputs[1])
+
+
+@register_torch_op
+def _transformer_encoder_layer_fwd(context, node):
+    """
+    The fast path of torch.nn.TransformerEncoderLayer, taken under the same conditions as the
+    one of nn.MultiheadAttention, and only for a relu or gelu activation
+
+    Input shapes/types:
+    - src : (B, seq, embed_dim)
+    - embed_dim, num_heads, then qkv_weight, qkv_bias, proj_weight, proj_bias
+      as in _native_multi_head_attention
+    - use_gelu : bool, relu otherwise
+    - norm_first : bool
+    - eps : float, shared by both layer norms
+    - norm_weight_1, norm_bias_1, norm_weight_2, norm_bias_2 : (embed_dim,)
+    - ffn_weight_1 : (dim_feedforward, embed_dim), ffn_bias_1 : (dim_feedforward,)
+    - ffn_weight_2 : (embed_dim, dim_feedforward), ffn_bias_2 : (embed_dim,)
+    - mask, mask_type : optional, as in _native_multi_head_attention
+
+    Output shape: (B, seq, embed_dim)
+    """
+    inputs = _get_inputs(context, node, expected=20)
+    src = inputs[0]
+    embed_dim = inputs[1].val
+    use_gelu = inputs[7].val
+    norm_first = inputs[8].val
+    eps = inputs[9].val
+    norm_weight_1, norm_bias_1, norm_weight_2, norm_bias_2 = inputs[10:14]
+    ffn_weight_1, ffn_bias_1, ffn_weight_2, ffn_bias_2 = inputs[14:18]
+    mask = inputs[18]
+    mask_type = inputs[19].val if inputs[19] is not None else None
+
+    def _layer_norm(x: Var, gamma: Var, beta: Var) -> Var:
+        return mb.layer_norm(x=x, axes=[-1], gamma=gamma, beta=beta, epsilon=eps)
+
+    x = _layer_norm(src, norm_weight_1, norm_bias_1) if norm_first else src
+    x, _ = _lower_native_multi_head_attention(
+        x,
+        x,
+        x,
+        embed_dim=embed_dim,
+        num_heads=inputs[2].val,
+        qkv_weight=inputs[3],
+        qkv_bias=inputs[4],
+        proj_weight=inputs[5],
+        proj_bias=inputs[6],
+        mask=mask,
+        mask_type=mask_type,
+        need_weights=False,
+        name=node.name,
+    )
+    x = mb.add(x=x, y=src)
+    if not norm_first:
+        x = _layer_norm(x, norm_weight_1, norm_bias_1)
+
+    residual = x
+    if norm_first:
+        x = _layer_norm(x, norm_weight_2, norm_bias_2)
+    x = _create_linear_layer(x, ffn_weight_1, ffn_bias_1)
+    x = mb.gelu(x=x, mode="EXACT") if use_gelu else mb.relu(x=x)
+    x = _create_linear_layer(x, ffn_weight_2, ffn_bias_2)
+    x = mb.add(x=x, y=residual)
+    if not norm_first:
+        x = _layer_norm(x, norm_weight_2, norm_bias_2)
+
+    context.add(mb.identity(x=x, name=node.name))
 
 
 @register_torch_op
