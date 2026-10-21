@@ -7859,16 +7859,18 @@ def clamp(context, node):
     max_val = inputs[2] if (len(inputs) > 2 and inputs[2]) else mb.const(val=np.finfo(np.float32).max)
     x, min_val, max_val = promote_input_dtypes([x, min_val, max_val])
 
-    if min_val.val is not None and max_val.val is not None and min_val.val >= max_val.val:
+    scalar_bounds = all(v.val is not None and np.ndim(v.val) == 0 for v in (min_val, max_val))
+    if scalar_bounds and min_val.val >= max_val.val:
         # When min >= max, PyTorch sets all values to max.
         context.add(mb.fill(shape=mb.shape(x=x), value=max_val.val, name=node.name))
         return
 
-    if min_val.val is None or max_val.val is None or not types.is_float(x.dtype):
-        # The `mb.clip` only support const alpha and beta, and requires the input to be float tensor.
-        # For other cases, need to use `mb.minimum` and `mb.maximum`.
-        res = mb.minimum(x=x, y=max_val)
-        res = mb.maximum(x=res, y=min_val)
+    if not scalar_bounds or not types.is_float(x.dtype):
+        # The `mb.clip` only support const scalar alpha and beta, and requires the input to be
+        # float tensor. For other cases, need to use `mb.maximum` and `mb.minimum`, in the order
+        # PyTorch applies them, so that where min > max the result is max.
+        res = mb.maximum(x=x, y=min_val)
+        res = mb.minimum(x=res, y=max_val)
     else:
         res = mb.clip(x=x, alpha=min_val, beta=max_val)
 
