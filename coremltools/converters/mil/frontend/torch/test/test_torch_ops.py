@@ -7716,6 +7716,61 @@ class TestElementWiseUnary(TorchBaseTest):
         )
 
     @pytest.mark.parametrize(
+        "compute_unit, backend, frontend",
+        itertools.product(
+            compute_units,
+            backends,
+            frontends,
+        ),
+    )
+    def test_clamp_non_const_range_min_above_max(self, compute_unit, backend, frontend):
+        # PyTorch applies min first and max second, so where min > max the result is max
+        input_data = torch.tensor([-3.0, 0.0, 3.0, -3.0, 0.0, 3.0])
+        input_min = torch.tensor([-1.0, -1.0, -1.0, 2.0, 2.0, 2.0])
+        input_max = torch.tensor([1.0, 1.0, 1.0, -2.0, -2.0, -2.0])
+
+        class TestModel(nn.Module):
+            def forward(self, input_data, input_min, input_max):
+                return torch.clamp(input_data, input_min, input_max)
+
+        self.run_compare_torch(
+            (input_data, input_min, input_max),
+            TestModel(),
+            frontend=frontend,
+            backend=backend,
+            compute_unit=compute_unit,
+            input_as_shape=False,
+        )
+
+    @pytest.mark.parametrize(
+        "compute_unit, backend, frontend",
+        itertools.product(
+            compute_units,
+            backends,
+            frontends,
+        ),
+    )
+    def test_clamp_const_tensor_range(self, compute_unit, backend, frontend):
+        # per-channel bounds stored on the module, including a channel where min > max
+        class TestModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("low", torch.tensor([-1.0, 0.0, 2.0]).reshape(3, 1))
+                self.register_buffer("high", torch.tensor([1.0, 0.5, -2.0]).reshape(3, 1))
+
+            def forward(self, x):
+                return torch.clamp(x, self.low, self.high)
+
+        self.run_compare_torch(
+            (2, 3, 4),
+            TestModel(),
+            frontend=frontend,
+            backend=backend,
+            compute_unit=compute_unit,
+            rand_range=(-5, 5),
+        )
+
+    @pytest.mark.parametrize(
         "compute_unit, backend, frontend, schema, input_int",
         itertools.product(
             compute_units,
